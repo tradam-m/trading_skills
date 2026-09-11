@@ -46,6 +46,79 @@ def get_earnings_data(symbol: str) -> dict:
     return result
 
 
+def macd_columns(macd_df: pd.DataFrame) -> tuple[str, str, str]:
+    """Return the (line, histogram, signal) column labels of a pandas-ta macd() frame.
+
+    pandas-ta names them MACD_, MACDh_, MACDs_ and orders them (line, histogram,
+    signal). Selecting by name prefix avoids depending on positional order.
+    """
+    line = next(c for c in macd_df.columns if c.startswith("MACD_"))
+    hist = next(c for c in macd_df.columns if c.startswith("MACDh_"))
+    signal = next(c for c in macd_df.columns if c.startswith("MACDs_"))
+    return line, hist, signal
+
+
+def adx_columns(adx_df: pd.DataFrame) -> tuple[str, str, str]:
+    """Return the (adx, +di, -di) column labels of a pandas-ta adx() frame.
+
+    pandas-ta names them ADX_, ADXR_, DMP_, DMN_ and places ADXR between the
+    ADX and DMP columns. Selecting by name avoids depending on positional
+    order, and the ADXR_ guard keeps the ADX_ prefix match from claiming it.
+    """
+    adx = next(c for c in adx_df.columns if c.startswith("ADX_") and not c.startswith("ADXR_"))
+    dmp = next(c for c in adx_df.columns if c.startswith("DMP_"))
+    dmn = next(c for c in adx_df.columns if c.startswith("DMN_"))
+    return adx, dmp, dmn
+
+
+def detect_macd_crossover(macd_df: pd.DataFrame) -> dict | None:
+    """Find the most recent MACD crossover in a pandas-ta macd() DataFrame.
+
+    Scans the histogram column (MACD line minus signal) for sign changes.
+    Returns {"direction": "up"|"down", "days_ago": int} or None if no
+    crossover is found. "days_ago" is trading bars since the crossover bar.
+    """
+    if macd_df is None or macd_df.empty:
+        return None
+
+    _, hist_col, _ = macd_columns(macd_df)
+    hist = macd_df[hist_col].dropna()
+    if len(hist) < 2:
+        return None
+
+    values = hist.to_numpy()
+    for i in range(len(values) - 1, 0, -1):
+        curr, prev = values[i], values[i - 1]
+        if curr > 0 and prev <= 0:
+            return {"direction": "up", "days_ago": len(values) - 1 - i}
+        if curr < 0 and prev >= 0:
+            return {"direction": "down", "days_ago": len(values) - 1 - i}
+
+    return None
+
+
+def detect_ema_crossover(ema_fast: pd.Series, ema_slow: pd.Series) -> dict | None:
+    """Find the most recent crossover between two EMA series (e.g. EMA9 vs EMA21).
+
+    Returns {"direction": "up"|"down", "days_ago": int} or None if no crossover
+    is found. "up" means ema_fast crossed above ema_slow (bullish).
+    "days_ago" is trading bars since the crossover bar.
+    """
+    diff = (ema_fast - ema_slow).dropna()
+    if len(diff) < 2:
+        return None
+
+    values = diff.to_numpy()
+    for i in range(len(values) - 1, 0, -1):
+        curr, prev = values[i], values[i - 1]
+        if curr > 0 and prev <= 0:
+            return {"direction": "up", "days_ago": len(values) - 1 - i}
+        if curr < 0 and prev >= 0:
+            return {"direction": "down", "days_ago": len(values) - 1 - i}
+
+    return None
+
+
 def compute_raw_indicators(df: pd.DataFrame) -> dict:
     """Extract raw technical indicator values from an OHLCV DataFrame.
 
@@ -61,6 +134,10 @@ def compute_raw_indicators(df: pd.DataFrame) -> dict:
         "macd_signal": None,
         "macd_hist": None,
         "prev_macd_hist": None,
+        "macd_crossover": None,
+        "ema9": None,
+        "ema21": None,
+        "ema_crossover": None,
         "adx": None,
         "dmp": None,
         "dmn": None,
@@ -91,12 +168,27 @@ def compute_raw_indicators(df: pd.DataFrame) -> dict:
         if pd.notna(val):
             result["sma50"] = float(val)
 
+    # EMA9 / EMA21
+    ema9_series = ta.ema(close, length=9)
+    ema21_series = ta.ema(close, length=21)
+    if ema9_series is not None and len(ema9_series) > 0:
+        val = ema9_series.iloc[-1]
+        if pd.notna(val):
+            result["ema9"] = float(val)
+    if ema21_series is not None and len(ema21_series) > 0:
+        val = ema21_series.iloc[-1]
+        if pd.notna(val):
+            result["ema21"] = float(val)
+    if ema9_series is not None and ema21_series is not None:
+        result["ema_crossover"] = detect_ema_crossover(ema9_series, ema21_series)
+
     # MACD
     macd = ta.macd(close)
     if macd is not None and len(macd) > 0:
-        line = macd.iloc[-1, 0]
-        signal = macd.iloc[-1, 1]
-        hist = macd.iloc[-1, 2]
+        line_col, hist_col, signal_col = macd_columns(macd)
+        line = macd[line_col].iloc[-1]
+        signal = macd[signal_col].iloc[-1]
+        hist = macd[hist_col].iloc[-1]
         if pd.notna(line):
             result["macd_line"] = float(line)
         if pd.notna(signal):
@@ -104,17 +196,19 @@ def compute_raw_indicators(df: pd.DataFrame) -> dict:
         if pd.notna(hist):
             result["macd_hist"] = float(hist)
         if len(macd) > 1:
-            prev = macd.iloc[-2, 2]
+            prev = macd[hist_col].iloc[-2]
             if pd.notna(prev):
                 result["prev_macd_hist"] = float(prev)
+        result["macd_crossover"] = detect_macd_crossover(macd)
 
     # ADX
     if "High" in df.columns and "Low" in df.columns:
         adx = ta.adx(df["High"], df["Low"], close, length=14)
         if adx is not None and len(adx) > 0:
-            adx_val = adx.iloc[-1, 0]
-            dmp_val = adx.iloc[-1, 1]
-            dmn_val = adx.iloc[-1, 2]
+            adx_col, dmp_col, dmn_col = adx_columns(adx)
+            adx_val = adx[adx_col].iloc[-1]
+            dmp_val = adx[dmp_col].iloc[-1]
+            dmn_val = adx[dmn_col].iloc[-1]
             if pd.notna(adx_val):
                 result["adx"] = float(adx_val)
             if pd.notna(dmp_val):
@@ -137,6 +231,7 @@ def compute_indicators(
 
     ticker = yf.Ticker(symbol)
     df = ticker.history(period=period)
+    df = df.dropna(subset=["Close"])
 
     if df.empty:
         return {"error": f"No data for {symbol}"}
@@ -177,6 +272,7 @@ def compute_indicators(
             "macd": round(raw["macd_line"], 4),
             "signal": round(raw["macd_signal"], 4),
             "histogram": round(raw["macd_hist"], 4),
+            "crossover": raw["macd_crossover"],
         }
         if raw["prev_macd_hist"] is not None:
             if raw["prev_macd_hist"] < 0 and raw["macd_hist"] > 0:
@@ -228,6 +324,11 @@ def compute_indicators(
             result["indicators"]["ema"]["ema12"] = round(ema12.iloc[-1], 2)
         if ema26 is not None and len(ema26) > 0:
             result["indicators"]["ema"]["ema26"] = round(ema26.iloc[-1], 2)
+        if raw["ema9"] is not None:
+            result["indicators"]["ema"]["ema9"] = round(raw["ema9"], 2)
+        if raw["ema21"] is not None:
+            result["indicators"]["ema"]["ema21"] = round(raw["ema21"], 2)
+        result["indicators"]["ema"]["crossover"] = raw["ema_crossover"]
 
     # ATR
     if "atr" in indicators:

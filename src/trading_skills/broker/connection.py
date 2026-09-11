@@ -2,11 +2,34 @@
 # ABOUTME: Provides context manager, position fetching, normalization, and spot price helpers.
 
 import asyncio
+import os
 from contextlib import asynccontextmanager
 
+from dotenv import load_dotenv
 from ib_async import IB, Stock
 
+from trading_skills.broker.futures import detect_future_exchange, front_future
 from trading_skills.utils import fetch_with_timeout
+
+
+def default_ib_port(fallback: int | None) -> int | None:
+    """Resolve the default IB port from the IB_PORT env var, else the fallback.
+
+    Reads IB_PORT (from the shell or a .env file). Used as the argparse default
+    for --port across all ib-* skills so the port need not be passed on every
+    call. An explicit --port flag still wins because argparse only applies this
+    default when the flag is absent. A missing, blank, or non-integer IB_PORT
+    yields the fallback.
+    """
+    load_dotenv()
+    raw = os.environ.get("IB_PORT")
+    if raw is None:
+        return fallback
+    try:
+        return int(raw.strip())
+    except ValueError:
+        return fallback
+
 
 # Documented clientId allocation — one source of truth for all broker modules.
 CLIENT_IDS = {
@@ -27,14 +50,18 @@ CLIENT_IDS = {
 
 
 @asynccontextmanager
-async def ib_connection(port: int, client_id: int):
+async def ib_connection(port: int, client_id: int, readonly: bool = True):
     """Connect to IB, yield the IB instance, disconnect on exit.
+
+    readonly=True (default) tells ib_async not to issue the write-class startup
+    order-sync, which TWS otherwise flags as needing API write access (popup).
+    Order-placing skills pass readonly=False when actually executing.
 
     Raises ConnectionError if the initial connection fails.
     """
     ib = IB()
     try:
-        await ib.connectAsync(host="127.0.0.1", port=port, clientId=client_id)
+        await ib.connectAsync(host="127.0.0.1", port=port, clientId=client_id, readonly=readonly)
     except Exception as e:
         raise ConnectionError(f"Could not connect to IB on port {port}: {e}") from e
 
@@ -125,3 +152,46 @@ async def fetch_spot_prices(ib: IB, symbols: list[str], timeout: float = 15.0) -
         if price and price > 0:
             prices[ticker.contract.symbol] = price
     return prices
+
+
+async def fetch_futures_spot_prices(
+    ib: IB, symbols: list[str], timeout: float = 15.0
+) -> dict[str, float]:
+    """Fetch spot prices for futures underlyings via IB continuous futures.
+
+    yfinance cannot price futures by bare symbol (e.g. "NQ"), so this uses IB
+    ContFuture contracts. Exchange is resolved dynamically from IB contract details.
+    Symbols whose exchange cannot be determined are silently skipped.
+    """
+    if not symbols:
+        return {}
+
+    pairs = await asyncio.gather(
+        *[_resolve_front_future(ib, sym) for sym in symbols], return_exceptions=True
+    )
+    contracts = [c for p in pairs if isinstance(p, tuple) and p[1] for _, c in [p]]
+    if not contracts:
+        return {}
+
+    tickers = [ib.reqMktData(c, "", False, False) for c in contracts]
+    await asyncio.sleep(3)
+    for c in contracts:
+        ib.cancelMktData(c)
+
+    prices = {}
+    for ticker in tickers:
+        if not ticker.contract:
+            continue
+        price = ticker.marketPrice()
+        if price and price > 0:
+            prices[ticker.contract.symbol] = price
+    return prices
+
+
+async def _resolve_front_future(ib: IB, symbol: str):
+    """Return (symbol, contract) for the front-month continuous future, or (symbol, None)."""
+    exchange = await detect_future_exchange(ib, symbol)
+    if not exchange:
+        return symbol, None
+    contract = await front_future(ib, symbol, exchange)
+    return symbol, contract

@@ -4,11 +4,16 @@
 
 import numpy as np
 import pandas as pd
+import pandas_ta as ta
+import pytest
 
 from trading_skills.technicals import (
+    adx_columns,
     compute_indicators,
     compute_multi_symbol,
     compute_raw_indicators,
+    detect_ema_crossover,
+    detect_macd_crossover,
     get_earnings_data,
 )
 
@@ -37,6 +42,24 @@ class TestComputeIndicators:
         assert "macd" in macd
         assert "signal" in macd
         assert "histogram" in macd
+
+    def test_macd_output_includes_crossover(self):
+        result = compute_indicators("AAPL", period="6mo")
+        macd = result["indicators"]["macd"]
+        assert "crossover" in macd
+        if macd["crossover"] is not None:
+            assert macd["crossover"]["direction"] in ("up", "down")
+            assert isinstance(macd["crossover"]["days_ago"], int)
+
+    def test_ema_output_includes_crossover(self):
+        result = compute_indicators("AAPL", period="6mo")
+        ema = result["indicators"]["ema"]
+        assert "ema9" in ema
+        assert "ema21" in ema
+        assert "crossover" in ema
+        if ema["crossover"] is not None:
+            assert ema["crossover"]["direction"] in ("up", "down")
+            assert isinstance(ema["crossover"]["days_ago"], int)
 
     def test_bollinger_bands(self):
         result = compute_indicators("AAPL", period="3mo")
@@ -116,6 +139,240 @@ class TestGetEarningsData:
         assert result["symbol"] == "INVALIDXYZ123"
 
 
+class TestAdxColumns:
+    """Tests for ADX/DI column selection."""
+
+    def test_selects_by_name_from_pandas_ta_layout(self):
+        # pandas-ta adx() emits four columns including ADXR between ADX and DMP.
+        df = pd.DataFrame(
+            {
+                "ADX_14": [20.0],
+                "ADXR_14_2": [19.0],
+                "DMP_14": [30.0],
+                "DMN_14": [10.0],
+            }
+        )
+        assert adx_columns(df) == ("ADX_14", "DMP_14", "DMN_14")
+
+    def test_column_order_independent(self):
+        df = pd.DataFrame(
+            {
+                "DMN_14": [10.0],
+                "ADXR_14_2": [19.0],
+                "ADX_14": [20.0],
+                "DMP_14": [30.0],
+            }
+        )
+        assert adx_columns(df) == ("ADX_14", "DMP_14", "DMN_14")
+
+    def test_does_not_return_adxr(self):
+        # ADXR starts with "ADX" too, so a naive prefix match could grab it.
+        df = pd.DataFrame(
+            {
+                "ADXR_14_2": [19.0],
+                "ADX_14": [20.0],
+                "DMP_14": [30.0],
+                "DMN_14": [10.0],
+            }
+        )
+        assert "ADXR_14_2" not in adx_columns(df)
+
+    def test_raw_indicators_di_reflect_directional_movement(self):
+        # A strictly rising series has positive directional movement only, so
+        # +DI must exceed -DI. Reading pandas-ta's columns positionally picks up
+        # ADXR as +DI and DMP as -DI, which inverts this.
+        n = 60
+        close = pd.Series(np.linspace(100.0, 160.0, n))
+        df = pd.DataFrame(
+            {
+                "Open": close,
+                "High": close + 1.0,
+                "Low": close - 1.0,
+                "Close": close,
+                "Volume": [1_000_000] * n,
+            }
+        )
+        raw = compute_raw_indicators(df)
+        assert raw["dmp"] > raw["dmn"]
+
+        expected = ta.adx(df["High"], df["Low"], df["Close"], length=14)
+        assert raw["dmp"] == pytest.approx(expected["DMP_14"].iloc[-1])
+        assert raw["dmn"] == pytest.approx(expected["DMN_14"].iloc[-1])
+        assert raw["adx"] == pytest.approx(expected["ADX_14"].iloc[-1])
+
+
+class TestDetectMacdCrossover:
+    """Tests for MACD crossover detection — uses synthetic histogram data."""
+
+    def _make_macd_df(self, hist_values):
+        """Minimal 3-column DataFrame matching pandas-ta macd() output layout.
+
+        pandas-ta column order is [MACD_, MACDh_, MACDs_] = (line, histogram, signal).
+        """
+        n = len(hist_values)
+        return pd.DataFrame(
+            {
+                "MACD_12_26_9": [1.0] * n,
+                "MACDh_12_26_9": hist_values,
+                "MACDs_12_26_9": [0.5] * n,
+            }
+        )
+
+    def test_reads_histogram_column_not_signal(self):
+        # Real pandas-ta layout: histogram crosses up at the last bar, while the
+        # signal line stays constant and never crosses zero. A detector that reads
+        # the signal column instead of the histogram would return None here.
+        df = pd.DataFrame(
+            {
+                "MACD_12_26_9": [1.0, 1.0, 1.0],
+                "MACDh_12_26_9": [-1.0, -0.5, 0.5],
+                "MACDs_12_26_9": [2.0, 2.0, 2.0],
+            }
+        )
+        result = detect_macd_crossover(df)
+        assert result == {"direction": "up", "days_ago": 0}
+
+    def test_column_order_independent(self):
+        # Columns selected by name, so declaration order must not matter.
+        df = pd.DataFrame(
+            {
+                "MACDs_12_26_9": [2.0, 2.0, 2.0],
+                "MACD_12_26_9": [1.0, 1.0, 1.0],
+                "MACDh_12_26_9": [1.0, 0.5, -0.5],
+            }
+        )
+        result = detect_macd_crossover(df)
+        assert result == {"direction": "down", "days_ago": 0}
+
+    def test_detects_up_crossover(self):
+        df = self._make_macd_df([-2.0, -1.0, 1.0, 2.0])
+        result = detect_macd_crossover(df)
+        assert result is not None
+        assert result["direction"] == "up"
+        assert result["days_ago"] == 1
+
+    def test_detects_down_crossover(self):
+        df = self._make_macd_df([2.0, 1.0, -1.0, -2.0])
+        result = detect_macd_crossover(df)
+        assert result is not None
+        assert result["direction"] == "down"
+        assert result["days_ago"] == 1
+
+    def test_crossover_at_current_bar(self):
+        df = self._make_macd_df([-1.0, 1.0])
+        result = detect_macd_crossover(df)
+        assert result is not None
+        assert result["direction"] == "up"
+        assert result["days_ago"] == 0
+
+    def test_returns_most_recent_crossover(self):
+        # Two crossovers: down at index 2, up at index 3 (most recent)
+        df = self._make_macd_df([-2.0, 1.0, -1.0, 2.0])
+        result = detect_macd_crossover(df)
+        assert result is not None
+        assert result["direction"] == "up"
+        assert result["days_ago"] == 0
+
+    def test_no_crossover_all_positive(self):
+        df = self._make_macd_df([1.0, 2.0, 3.0, 4.0])
+        result = detect_macd_crossover(df)
+        assert result is None
+
+    def test_no_crossover_all_negative(self):
+        df = self._make_macd_df([-4.0, -3.0, -2.0, -1.0])
+        result = detect_macd_crossover(df)
+        assert result is None
+
+    def test_handles_leading_nans(self):
+        df = self._make_macd_df([float("nan"), float("nan"), -1.0, 1.0])
+        result = detect_macd_crossover(df)
+        assert result is not None
+        assert result["direction"] == "up"
+        assert result["days_ago"] == 0
+
+    def test_too_short_returns_none(self):
+        df = self._make_macd_df([1.0])
+        result = detect_macd_crossover(df)
+        assert result is None
+
+    def test_empty_returns_none(self):
+        df = self._make_macd_df([])
+        result = detect_macd_crossover(df)
+        assert result is None
+
+
+class TestDetectEmaCrossover:
+    """Tests for EMA9/EMA21 crossover detection using synthetic Series."""
+
+    def _make_series(self, values):
+        return pd.Series(values, dtype=float)
+
+    def test_detects_up_crossover(self):
+        # ema9 crosses above ema21: diff goes negative to positive
+        ema9 = self._make_series([8.0, 9.0, 11.0, 12.0])
+        ema21 = self._make_series([10.0, 10.0, 10.0, 10.0])
+        result = detect_ema_crossover(ema9, ema21)
+        assert result is not None
+        assert result["direction"] == "up"
+        assert result["days_ago"] == 1
+
+    def test_detects_down_crossover(self):
+        # ema9 crosses below ema21
+        ema9 = self._make_series([12.0, 11.0, 9.0, 8.0])
+        ema21 = self._make_series([10.0, 10.0, 10.0, 10.0])
+        result = detect_ema_crossover(ema9, ema21)
+        assert result is not None
+        assert result["direction"] == "down"
+        assert result["days_ago"] == 1
+
+    def test_crossover_at_current_bar(self):
+        ema9 = self._make_series([9.0, 11.0])
+        ema21 = self._make_series([10.0, 10.0])
+        result = detect_ema_crossover(ema9, ema21)
+        assert result is not None
+        assert result["direction"] == "up"
+        assert result["days_ago"] == 0
+
+    def test_returns_most_recent_crossover(self):
+        # Two crossovers: down at index 2, up at index 3
+        ema9 = self._make_series([9.0, 11.0, 9.0, 11.0])
+        ema21 = self._make_series([10.0, 10.0, 10.0, 10.0])
+        result = detect_ema_crossover(ema9, ema21)
+        assert result is not None
+        assert result["direction"] == "up"
+        assert result["days_ago"] == 0
+
+    def test_no_crossover_ema9_always_above(self):
+        ema9 = self._make_series([11.0, 12.0, 13.0, 14.0])
+        ema21 = self._make_series([10.0, 10.0, 10.0, 10.0])
+        result = detect_ema_crossover(ema9, ema21)
+        assert result is None
+
+    def test_no_crossover_ema9_always_below(self):
+        ema9 = self._make_series([9.0, 8.0, 7.0, 6.0])
+        ema21 = self._make_series([10.0, 10.0, 10.0, 10.0])
+        result = detect_ema_crossover(ema9, ema21)
+        assert result is None
+
+    def test_handles_leading_nans(self):
+        ema9 = self._make_series([float("nan"), float("nan"), 9.0, 11.0])
+        ema21 = self._make_series([float("nan"), float("nan"), 10.0, 10.0])
+        result = detect_ema_crossover(ema9, ema21)
+        assert result is not None
+        assert result["direction"] == "up"
+        assert result["days_ago"] == 0
+
+    def test_too_short_returns_none(self):
+        ema9 = self._make_series([11.0])
+        ema21 = self._make_series([10.0])
+        result = detect_ema_crossover(ema9, ema21)
+        assert result is None
+
+    def test_empty_returns_none(self):
+        result = detect_ema_crossover(self._make_series([]), self._make_series([]))
+        assert result is None
+
+
 class TestComputeRawIndicators:
     """Tests for raw indicator extraction from DataFrame."""
 
@@ -146,11 +403,41 @@ class TestComputeRawIndicators:
             "macd_signal",
             "macd_hist",
             "prev_macd_hist",
+            "macd_crossover",
+            "ema9",
+            "ema21",
+            "ema_crossover",
             "adx",
             "dmp",
             "dmn",
         }
         assert expected_keys.issubset(raw.keys())
+
+    def test_ema_values(self):
+        df = self._make_df()
+        raw = compute_raw_indicators(df)
+        assert raw["ema9"] is not None
+        assert raw["ema21"] is not None
+        assert isinstance(raw["ema9"], float)
+        assert isinstance(raw["ema21"], float)
+
+    def test_ema_crossover_structure(self):
+        df = self._make_df()
+        raw = compute_raw_indicators(df)
+        xover = raw["ema_crossover"]
+        if xover is not None:
+            assert xover["direction"] in ("up", "down")
+            assert isinstance(xover["days_ago"], int)
+            assert xover["days_ago"] >= 0
+
+    def test_macd_crossover_structure(self):
+        df = self._make_df()
+        raw = compute_raw_indicators(df)
+        xover = raw["macd_crossover"]
+        if xover is not None:
+            assert xover["direction"] in ("up", "down")
+            assert isinstance(xover["days_ago"], int)
+            assert xover["days_ago"] >= 0
 
     def test_rsi_in_range(self):
         df = self._make_df()
@@ -172,6 +459,18 @@ class TestComputeRawIndicators:
         assert raw["macd_signal"] is not None
         assert raw["macd_hist"] is not None
         assert raw["prev_macd_hist"] is not None
+
+    def test_macd_columns_mapped_to_correct_names(self):
+        # signal must come from MACDs_, histogram from MACDh_ — not positionally swapped.
+        df = self._make_df()
+        macd = ta.macd(df["Close"])
+        raw = compute_raw_indicators(df)
+        assert raw["macd_line"] == pytest.approx(macd["MACD_12_26_9"].iloc[-1])
+        assert raw["macd_signal"] == pytest.approx(macd["MACDs_12_26_9"].iloc[-1])
+        assert raw["macd_hist"] == pytest.approx(macd["MACDh_12_26_9"].iloc[-1])
+        assert raw["prev_macd_hist"] == pytest.approx(macd["MACDh_12_26_9"].iloc[-2])
+        # Defining identity of MACD: histogram = line - signal.
+        assert raw["macd_hist"] == pytest.approx(raw["macd_line"] - raw["macd_signal"])
 
     def test_adx_values(self):
         df = self._make_df()

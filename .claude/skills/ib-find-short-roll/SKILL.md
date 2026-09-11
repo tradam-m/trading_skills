@@ -8,11 +8,16 @@ dependencies: ["trading-skills"]
 
 Analyze roll options for short positions or find best short options to open against long stock using real-time data from Interactive Brokers.
 
-## Prerequisites
+## IB Connection
 
-User must have TWS or IB Gateway running locally with API enabled:
-- Paper trading: port 7497
-- Live trading: port 7496
+TWS or IB Gateway must be running locally with API enabled:
+- **Paper trading** — port 7497
+- **Live trading** — port 7496
+- **`IB_PORT` env var** — default port when `--port` is omitted (e.g. `IB_PORT=4001` for a Gateway container). Precedence: `--port` flag > `IB_PORT` > built-in default. Set it in the shell or a `.env` file.
+
+**Port fallback:** If the configured port fails, automatically retry on the other port.
+If the retry succeeds, save to memory which account type worked (live/paper) and reuse it for all IB skill calls in this and future sessions — until the user explicitly asks for the other account.
+If both ports fail, ask the user to verify that TWS or IB Gateway is running with API access enabled.
 
 ## Instructions
 
@@ -21,7 +26,7 @@ User must have TWS or IB Gateway running locally with API enabled:
 > **Note:** If `uv` is not installed or `pyproject.toml` is not found, replace `uv run python` with `python` in all commands below.
 
 ```bash
-uv run python scripts/roll.py SYMBOL [--strike STRIKE] [--expiry YYYYMMDD] [--right C|P] [--port PORT] [--account ACCOUNT]
+uv run python scripts/roll.py SYMBOL [--strike STRIKE] [--expiry YYYYMMDD] [--right C|P] [--port PORT] [--account ACCOUNT] [--iv-multiplier N]
 ```
 
 The script returns JSON to stdout with all position and candidate data.
@@ -47,8 +52,9 @@ Present key findings to the user: recommended position, credit/debit, and the sa
 - `--strike` - Current short strike price (optional, auto-detects from portfolio)
 - `--expiry` - Current short expiration in YYYYMMDD format (optional, auto-detects)
 - `--right` - Option type: C for call, P for put (default: C)
-- `--port` - IB port (default: 7496 for live trading)
+- `--port` - IB port (default: 7497 for paper trading)
 - `--account` - Specific account ID (optional)
+- `--iv-multiplier` - Expected-move multiplier for strike band width (default: 2.0); increase for high-IV names to surface wider roll candidates
 
 ## JSON Output
 
@@ -64,15 +70,18 @@ The script outputs JSON with `mode` field indicating the analysis type:
 - `expirations_analyzed` - List of expiry dates checked
 
 ### Mode-specific Fields
-- **roll**: `current_position`, `buy_to_close`, `roll_candidates` (dict of expiry -> candidates)
+- **roll**: `current_position` (includes `iv` and `delta` from IB greeks), `buy_to_close`, `roll_candidates` (dict of expiry -> candidates), `iv_multiplier`
 - **spread**: `long_option`, `right`, `candidates_by_expiry`
-- **new_short**: `long_position`, `right`, `candidates_by_expiry`
+- **new_short**: `long_position`, `right`, `candidates_by_expiry`, `iv_multiplier`
+
+### Strike Band Logic (roll and new_short modes)
+The strike search window is IV-aware: `half_band = iv_multiplier × ATM_IV × spot × √(T/365)` where T is the DTE of the nearest roll expiry. For roll mode, ATM IV comes from IB model greeks on the current position's quote; if unavailable, it is estimated from the option mid-price using the Brenner-Subrahmanyam approximation. For new_short mode, a conservative default IV of 30% is used. This makes the band automatically wider for high-IV underlyings without requiring a manual override.
 
 ## Example Usage
 
 ```bash
 # Auto-detect GOOG position (short option, long option, or long stock)
-uv run python scripts/roll.py GOOG --port 7496
+uv run python scripts/roll.py GOOG --port 7497
 
 # Specify exact short position to roll
 uv run python scripts/roll.py GOOG --strike 350 --expiry 20260206 --right C

@@ -8,11 +8,16 @@ dependencies: ["trading-skills"]
 
 Calculate and report delta-adjusted notional exposure across all Interactive Brokers accounts.
 
-## Prerequisites
+## IB Connection
 
-User must have TWS or IB Gateway running locally with API enabled:
-- Paper trading: port 7497
-- Live/Production trading: port 7496
+TWS or IB Gateway must be running locally with API enabled:
+- **Paper trading** — port 7497
+- **Live trading** — port 7496
+- **`IB_PORT` env var** — default port when `--port` is omitted (e.g. `IB_PORT=4001` for a Gateway container). Precedence: `--port` flag > `IB_PORT` > built-in default. Set it in the shell or a `.env` file.
+
+**Port fallback:** If the configured port fails, automatically retry on the other port.
+If the retry succeeds, save to memory which account type worked (live/paper) and reuse it for all IB skill calls in this and future sessions — until the user explicitly asks for the other account.
+If both ports fail, ask the user to verify that TWS or IB Gateway is running with API access enabled.
 
 ## Instructions
 
@@ -36,7 +41,7 @@ Present the summary table (total long, short, net) and top exposures to the user
 
 ## Arguments
 
-- `--port` - IB port (default: 7496 for live trading, use 7497 for paper)
+- `--port` - IB port (default: 7497 for paper trading)
 
 ## JSON Output
 
@@ -61,11 +66,11 @@ Delta-adjusted notional = delta x spot price x quantity x multiplier
 ## Examples
 
 ```bash
-# Live trading (default port 7496)
+# Paper trading (default)
 uv run python scripts/delta_exposure.py
 
-# Paper trading (port 7497)
-uv run python scripts/delta_exposure.py --port 7497
+# Live trading
+uv run python scripts/delta_exposure.py --port 7496
 ```
 
 
